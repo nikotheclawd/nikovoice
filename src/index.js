@@ -316,31 +316,55 @@ function startRecording(state, userId) {
     cleanupRecording(state, userId);
   });
 
-  // When the Opus stream ends (after silence), finalize.
-  opusStream.on('end', () => {
+  const endAndFinalize = (reason) => {
     const durationMs = bytesToMs(recording.bytes);
-    logEvent('recording_end', { userId, durationMs });
+    logEvent('recording_end', { userId, durationMs, reason });
 
-    if (durationMs < MIN_UTTERANCE_MS) {
-      cleanupRecording(state, userId);
+    if (durationMs >= MIN_UTTERANCE_MS) {
+      finalizeRecording(state, recording).catch((err) => {
+        console.error('Finalize error', err);
+      });
+    }
+
+    cleanupRecording(state, userId);
+    try {
+      opusStream.destroy();
+    } catch {}
+  };
+
+  // Fallback silence detector (works even if EndBehavior doesn't emit reliably)
+  const interval = setInterval(() => {
+    const now = Date.now();
+    const silenceFor = now - recording.lastAudioAt;
+    const durationMs = bytesToMs(recording.bytes);
+
+    if (durationMs >= MAX_UTTERANCE_MS) {
+      endAndFinalize('max_utterance');
       return;
     }
 
-    finalizeRecording(state, recording).catch((err) => {
-      console.error('Finalize error', err);
-    });
+    if (silenceFor >= SILENCE_MS && durationMs >= MIN_UTTERANCE_MS) {
+      endAndFinalize('silence_timer');
+      return;
+    }
 
-    cleanupRecording(state, userId);
-  });
+    if (silenceFor >= SILENCE_MS * 6) {
+      // Give up if we never got enough audio.
+      cleanupRecording(state, userId);
+      try {
+        opusStream.destroy();
+      } catch {}
+    }
+  }, 200);
 
-  // Keep the old speaking logs as diagnostics.
-  receiver.speaking.on('start', (speakingId) => {
-    if (speakingId !== userId) return;
-    logEvent('speaking_start', {
-      userId: speakingId,
-      guildId: state.guildId,
-      channelId: state.channelId
-    });
+  state.timers.set(userId, interval);
+
+  // When the Opus stream ends/closes, finalize.
+  opusStream.on('end', () => endAndFinalize('opus_end'));
+  opusStream.on('close', () => endAndFinalize('opus_close'));
+  opusStream.on('error', (err) => {
+    console.error('Opus stream error', err);
+    endAndFinalize('opus_error');
   });
 }
 
