@@ -542,15 +542,31 @@ async function speak(state, text, userId) {
 
   // 1) Generate WAV via sherpa-onnx
   const outWav = `/tmp/niko-tts-${Date.now()}-${Math.random().toString(16).slice(2)}.wav`;
-  const sherpaBin = '/usr/lib/node_modules/openclaw/skills/sherpa-onnx-tts/bin/sherpa-onnx-tts';
+
+  const modelFile = process.env.SHERPA_ONNX_MODEL_FILE || `${modelDir}/en_US-lessac-high.onnx`;
+  const tokensFile = process.env.SHERPA_ONNX_TOKENS_FILE || `${modelDir}/tokens.txt`;
+  const dataDir = process.env.SHERPA_ONNX_DATA_DIR || `${modelDir}/espeak-ng-data`;
 
   const { spawn } = await import('node:child_process');
 
+  const sherpaExe = `${runtimeDir}/bin/sherpa-onnx-offline-tts`;
+  const libDir = `${runtimeDir}/lib`;
+
+  // 1) Generate WAV via sherpa-onnx binary (offline)
   await new Promise((resolve, reject) => {
+    const env = { ...process.env };
+    env.LD_LIBRARY_PATH = env.LD_LIBRARY_PATH ? `${libDir}:${env.LD_LIBRARY_PATH}` : libDir;
+
     const p = spawn(
-      sherpaBin,
-      ['--runtime-dir', runtimeDir, '--model-dir', modelDir, '--output', outWav, text],
-      { stdio: ['ignore', 'pipe', 'pipe'] }
+      sherpaExe,
+      [
+        `--vits-model=${modelFile}`,
+        `--vits-tokens=${tokensFile}`,
+        `--vits-data-dir=${dataDir}`,
+        `--output-filename=${outWav}`,
+        text
+      ],
+      { stdio: ['ignore', 'pipe', 'pipe'], env }
     );
 
     let stderr = '';
@@ -558,7 +574,7 @@ async function speak(state, text, userId) {
     p.on('error', reject);
     p.on('exit', (code) => {
       if (code === 0) return resolve();
-      reject(new Error(`sherpa-onnx-tts failed (code=${code}): ${stderr}`));
+      reject(new Error(`sherpa-onnx-offline-tts failed (code=${code}): ${stderr}`));
     });
   }).catch((err) => {
     console.error('Local TTS error', err);
