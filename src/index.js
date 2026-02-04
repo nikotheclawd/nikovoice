@@ -63,6 +63,26 @@ client.on('ready', () => {
   }
 });
 
+client.on('voiceStateUpdate', (oldState, newState) => {
+  // Track changes affecting the bot or allowlisted users.
+  const watched = new Set([client.user?.id, ...ALLOWLIST]);
+  if (!watched.has(newState.id) && !watched.has(oldState.id)) return;
+
+  const s = (st) => ({
+    channelId: st.channelId || null,
+    serverMute: Boolean(st.serverMute),
+    serverDeaf: Boolean(st.serverDeaf),
+    selfMute: Boolean(st.selfMute),
+    selfDeaf: Boolean(st.selfDeaf)
+  });
+
+  logEvent('voice_state_update', {
+    userId: newState.id,
+    old: s(oldState),
+    now: s(newState)
+  });
+});
+
 client.on('messageCreate', async (message) => {
   if (message.author.bot || !message.guild) return;
   if (!ALLOWLIST.has(message.author.id)) return;
@@ -121,7 +141,8 @@ async function connectToChannel(voiceChannel, { manualLeave, autoJoin } = {}) {
     channelId: voiceChannel.id,
     guildId: voiceChannel.guild.id,
     adapterCreator: voiceChannel.guild.voiceAdapterCreator,
-    selfDeaf: false
+    selfDeaf: false,
+    selfMute: false
   });
 
   const player = createAudioPlayer();
@@ -180,7 +201,8 @@ async function attemptRejoin(state) {
     channelId: channel.id,
     guildId: channel.guild.id,
     adapterCreator: channel.guild.voiceAdapterCreator,
-    selfDeaf: false
+    selfDeaf: false,
+    selfMute: false
   });
 
   state.connection.destroy();
@@ -199,7 +221,20 @@ function setupReceiver(state, guildId, channelId) {
   const receiver = state.connection.receiver;
 
   receiver.speaking.on('start', (userId) => {
-    if (!ALLOWLIST.has(userId)) return;
+    logEvent('speaking_start', {
+      userId,
+      guildId,
+      channelId
+    });
+
+    if (!ALLOWLIST.has(userId)) {
+      logEvent('speaking_ignored_not_allowlisted', {
+        userId,
+        guildId,
+        channelId
+      });
+      return;
+    }
     if (state.recordings.has(userId)) return;
 
     const opusStream = receiver.subscribe(userId, {
