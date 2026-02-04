@@ -643,6 +643,62 @@ async function speak(state, text, userId) {
     return;
   }
 
+  const provider = (process.env.TTS_PROVIDER || 'openai').toLowerCase();
+
+  const { spawn } = await import('node:child_process');
+
+  // --- OpenAI TTS (fast, online) ---
+  if (provider === 'openai') {
+    logEvent('openai_tts_request', { userId: userId || 'unknown' });
+
+    const res = await fetch(`${OPENAI_BASE_URL}/v1/audio/speech`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        model: TTS_MODEL,
+        voice: TTS_VOICE,
+        format: 'mp3',
+        input: String(text || '').slice(0, 800)
+      })
+    });
+
+    if (!res.ok) {
+      const body = await res.text();
+      console.error('OpenAI TTS error', res.status, body);
+      return;
+    }
+
+    const audioBuf = Buffer.from(await res.arrayBuffer());
+
+    const ffmpeg = spawn(
+      'ffmpeg',
+      ['-hide_banner', '-loglevel', 'error', '-i', 'pipe:0', '-f', 's16le', '-ar', '48000', '-ac', '2', 'pipe:1'],
+      { stdio: ['pipe', 'pipe', 'pipe'] }
+    );
+
+    let ffErr = '';
+    ffmpeg.stderr.on('data', (d) => (ffErr += d.toString()));
+    ffmpeg.on('exit', (code) => {
+      if (code && code !== 0) {
+        console.error('ffmpeg failed', code, ffErr);
+      } else {
+        logEvent('ffmpeg_ok', { userId: userId || 'unknown' });
+      }
+    });
+
+    ffmpeg.stdin.end(audioBuf);
+
+    const resource = createAudioResource(ffmpeg.stdout, { inputType: StreamType.Raw });
+    state.player.play(resource);
+    logEvent('player_play', { userId: userId || 'unknown' });
+
+    return;
+  }
+
+  // --- Sherpa offline fallback ---
   const runtimeDir = process.env.SHERPA_ONNX_RUNTIME_DIR || '';
   const modelDir = process.env.SHERPA_ONNX_MODEL_DIR || '';
 
@@ -657,8 +713,6 @@ async function speak(state, text, userId) {
   const modelFile = process.env.SHERPA_ONNX_MODEL_FILE || `${modelDir}/en_US-lessac-high.onnx`;
   const tokensFile = process.env.SHERPA_ONNX_TOKENS_FILE || `${modelDir}/tokens.txt`;
   const dataDir = process.env.SHERPA_ONNX_DATA_DIR || `${modelDir}/espeak-ng-data`;
-
-  const { spawn } = await import('node:child_process');
 
   const sherpaExe = `${runtimeDir}/bin/sherpa-onnx-offline-tts`;
   const libDir = `${runtimeDir}/lib`;
