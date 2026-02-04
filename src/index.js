@@ -337,6 +337,16 @@ function startRecording(state, userId) {
   state.recordings.set(userId, recording);
 
   pcmStream.on('data', (chunk) => {
+    // Avoid feedback/echo: ignore incoming audio while we're speaking
+    if (
+      state.player.state.status === AudioPlayerStatus.Playing ||
+      state.player.state.status === AudioPlayerStatus.Buffering
+    ) {
+      recording.preRoll = [];
+      recording.preRollBytes = 0;
+      return;
+    }
+
     const now = Date.now();
     const energetic = hasVoiceEnergy(chunk, SILENCE_THRESHOLD);
 
