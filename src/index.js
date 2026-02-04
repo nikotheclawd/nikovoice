@@ -230,6 +230,13 @@ async function connectToChannel(voiceChannel, { manualLeave, autoJoin } = {}) {
 
 function attachConnectionHandlers(state) {
   state.connection.on('stateChange', (oldState, newState) => {
+    logEvent('voice_conn_state', {
+      old: oldState.status,
+      now: newState.status,
+      guildId: state.guildId,
+      channelId: state.channelId
+    });
+
     if (newState.status === VoiceConnectionStatus.Disconnected) {
       logEvent('voice_disconnected', {
         guildId: state.guildId,
@@ -598,7 +605,7 @@ async function speak(state, text, userId) {
 
   // Ensure voice connection is ready before attempting playback
   try {
-    await entersState(state.connection, VoiceConnectionStatus.Ready, 10_000);
+    await entersState(state.connection, VoiceConnectionStatus.Ready, 30_000);
     logEvent('voice_ready_ok', { userId: userId || 'unknown' });
   } catch (err) {
     console.error('Voice connection not ready for playback', err);
