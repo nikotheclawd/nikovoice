@@ -7,7 +7,8 @@ import {
   StreamType,
   AudioPlayerStatus,
   EndBehaviorType,
-  VoiceConnectionStatus
+  VoiceConnectionStatus,
+  entersState
 } from '@discordjs/voice';
 import prism from 'prism-media';
 import { Readable } from 'node:stream';
@@ -179,6 +180,16 @@ async function connectToChannel(voiceChannel, { manualLeave, autoJoin } = {}) {
 
   const player = createAudioPlayer();
   connection.subscribe(player);
+
+  player.on('stateChange', (oldState, newState) => {
+    logEvent('player_state', {
+      old: oldState.status,
+      now: newState.status
+    });
+  });
+  player.on('error', (err) => {
+    console.error('Audio player error', err);
+  });
 
   const state = {
     connection,
@@ -583,6 +594,14 @@ async function speak(state, text, userId) {
     channelId: state.channelId
   });
 
+  // Ensure voice connection is ready before attempting playback
+  try {
+    await entersState(state.connection, VoiceConnectionStatus.Ready, 10_000);
+  } catch (err) {
+    console.error('Voice connection not ready for playback', err);
+    return;
+  }
+
   const runtimeDir = process.env.SHERPA_ONNX_RUNTIME_DIR || '';
   const modelDir = process.env.SHERPA_ONNX_MODEL_DIR || '';
 
@@ -643,11 +662,14 @@ async function speak(state, text, userId) {
   ffmpeg.on('exit', (code) => {
     if (code && code !== 0) {
       console.error('ffmpeg failed', code, ffErr);
+    } else {
+      logEvent('ffmpeg_ok', { userId: userId || 'unknown' });
     }
   });
 
   const resource = createAudioResource(ffmpeg.stdout, { inputType: StreamType.Raw });
   state.player.play(resource);
+  logEvent('player_play', { userId: userId || 'unknown' });
 
   // Cleanup temp wav a bit later
   setTimeout(async () => {
