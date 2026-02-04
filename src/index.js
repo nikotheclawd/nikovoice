@@ -532,32 +532,63 @@ async function speak(state, text, userId) {
     channelId: state.channelId
   });
 
-  const res = await fetch(`${OPENAI_BASE_URL}/v1/audio/speech`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({
-      model: TTS_MODEL,
-      voice: TTS_VOICE,
-      input: text,
-      response_format: 'opus'
-    })
-  });
+  const runtimeDir = process.env.SHERPA_ONNX_RUNTIME_DIR || '';
+  const modelDir = process.env.SHERPA_ONNX_MODEL_DIR || '';
 
-  if (!res.ok) {
-    const body = await res.text();
-    console.error('TTS error', res.status, body);
+  if (!runtimeDir || !modelDir) {
+    console.error('Missing SHERPA_ONNX_RUNTIME_DIR / SHERPA_ONNX_MODEL_DIR (local TTS not configured)');
     return;
   }
 
-  const arrayBuffer = await res.arrayBuffer();
-  const buffer = Buffer.from(arrayBuffer);
-  const stream = Readable.from(buffer);
-  const resource = createAudioResource(stream, { inputType: StreamType.OggOpus });
+  // 1) Generate WAV via sherpa-onnx
+  const outWav = `/tmp/niko-tts-${Date.now()}-${Math.random().toString(16).slice(2)}.wav`;
+  const sherpaBin = '/usr/lib/node_modules/openclaw/skills/sherpa-onnx-tts/bin/sherpa-onnx-tts';
 
+  const { spawn } = await import('node:child_process');
+
+  await new Promise((resolve, reject) => {
+    const p = spawn(
+      sherpaBin,
+      ['--runtime-dir', runtimeDir, '--model-dir', modelDir, '--output', outWav, text],
+      { stdio: ['ignore', 'pipe', 'pipe'] }
+    );
+
+    let stderr = '';
+    p.stderr.on('data', (d) => (stderr += d.toString()));
+    p.on('error', reject);
+    p.on('exit', (code) => {
+      if (code === 0) return resolve();
+      reject(new Error(`sherpa-onnx-tts failed (code=${code}): ${stderr}`));
+    });
+  }).catch((err) => {
+    console.error('Local TTS error', err);
+  });
+
+  // 2) Transcode WAV -> raw PCM and play (discordjs/voice will opus-encode)
+  const ffmpeg = spawn(
+    'ffmpeg',
+    ['-hide_banner', '-loglevel', 'error', '-i', outWav, '-f', 's16le', '-ar', '48000', '-ac', '2', 'pipe:1'],
+    { stdio: ['ignore', 'pipe', 'pipe'] }
+  );
+
+  let ffErr = '';
+  ffmpeg.stderr.on('data', (d) => (ffErr += d.toString()));
+  ffmpeg.on('exit', (code) => {
+    if (code && code !== 0) {
+      console.error('ffmpeg failed', code, ffErr);
+    }
+  });
+
+  const resource = createAudioResource(ffmpeg.stdout, { inputType: StreamType.Raw });
   state.player.play(resource);
+
+  // Cleanup temp wav a bit later
+  setTimeout(async () => {
+    try {
+      const { unlink } = await import('node:fs/promises');
+      await unlink(outWav);
+    } catch {}
+  }, 30_000);
 
   if (state.player.state.status === AudioPlayerStatus.Playing) {
     await delay(100);
