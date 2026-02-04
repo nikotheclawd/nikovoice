@@ -552,6 +552,9 @@ async function transcribe(wavBuffer) {
   const form = new FormData();
   form.append('file', new Blob([wavBuffer], { type: 'audio/wav' }), 'audio.wav');
   form.append('model', WHISPER_MODEL);
+  // Force Italian to avoid random English garbage when audio is short/noisy
+  form.append('language', 'it');
+  form.append('temperature', '0');
 
   const res = await fetch(`${OPENAI_BASE_URL}/v1/audio/transcriptions`, {
     method: 'POST',
