@@ -24,9 +24,10 @@ const TTS_MODEL = process.env.TTS_MODEL || 'gpt-4o-mini-tts';
 const TTS_VOICE = process.env.TTS_VOICE || 'alloy';
 const VOICE_CHANNEL_ID = process.env.VOICE_CHANNEL_ID || '';
 
-const SILENCE_MS = Number(process.env.SILENCE_MS || 1200);
-const MIN_UTTERANCE_MS = Number(process.env.MIN_UTTERANCE_MS || 700);
+const SILENCE_MS = Number(process.env.SILENCE_MS || 800);
+const MIN_UTTERANCE_MS = Number(process.env.MIN_UTTERANCE_MS || 600);
 const SILENCE_THRESHOLD = Number(process.env.SILENCE_THRESHOLD || 0.01); // RMS threshold 0-1
+const PRE_ROLL_MS = Number(process.env.PRE_ROLL_MS || 300);
 const MAX_UTTERANCE_MS = Number(process.env.MAX_UTTERANCE_MS || 15000);
 const RATE_LIMIT_WINDOW_MS = Number(process.env.RATE_LIMIT_WINDOW_MS || 60000);
 const RATE_LIMIT_STT_MAX = Number(process.env.RATE_LIMIT_STT_MAX || 10);
@@ -326,6 +327,9 @@ function startRecording(state, userId) {
     active: false,
     chunks: [],
     bytes: 0,
+    // ring buffer before voice is detected, to avoid cutting the first syllable
+    preRoll: [],
+    preRollBytes: 0,
     channelId: state.channelId,
     guildId: state.guildId
   };
@@ -336,14 +340,27 @@ function startRecording(state, userId) {
     const now = Date.now();
     const energetic = hasVoiceEnergy(chunk, SILENCE_THRESHOLD);
 
+    // Maintain a short pre-roll buffer while not active
     if (!recording.active) {
+      const maxPreRollBytes = Math.floor((PRE_ROLL_MS / 1000) * 48000 * 2 * 2);
+      recording.preRoll.push(chunk);
+      recording.preRollBytes += chunk.length;
+      while (recording.preRollBytes > maxPreRollBytes && recording.preRoll.length > 1) {
+        const removed = recording.preRoll.shift();
+        recording.preRollBytes -= removed.length;
+      }
+
       if (!energetic) return;
-      // Start of an utterance
+
+      // Start of an utterance (include pre-roll)
       recording.active = true;
       recording.startedAt = now;
       recording.lastAudioAt = now;
-      recording.chunks = [];
-      recording.bytes = 0;
+      recording.chunks = [...recording.preRoll];
+      recording.bytes = recording.preRollBytes;
+      recording.preRoll = [];
+      recording.preRollBytes = 0;
+
       logEvent('utterance_start', { userId });
     }
 
