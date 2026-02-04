@@ -330,6 +330,29 @@ function startRecording(state, userId) {
     try {
       opusStream.destroy();
     } catch {}
+
+    // Rearm: keep a "hot" subscription so we don't depend on speaking events.
+    // If the user is still in the channel, start a fresh recording shortly after.
+    setTimeout(() => {
+      try {
+        const channel = client.channels.cache.get(state.channelId);
+        const stillHere = channel?.isVoiceBased?.() && channel.members?.has?.(userId);
+        if (!stillHere) return;
+        if (state.manualLeave) return;
+        if (state.recordings.has(userId)) return;
+
+        logEvent('recording_rearm', {
+          userId,
+          guildId: state.guildId,
+          channelId: state.channelId,
+          prevReason: reason,
+          prevDurationMs: durationMs
+        });
+        startRecording(state, userId);
+      } catch (err) {
+        console.error('recording_rearm error', err);
+      }
+    }, 250);
   };
 
   // Fallback silence detector (works even if EndBehavior doesn't emit reliably)
