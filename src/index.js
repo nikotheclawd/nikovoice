@@ -202,6 +202,13 @@ async function connectToChannel(voiceChannel, { manualLeave, autoJoin } = {}) {
     autoJoin: Boolean(autoJoin)
   });
 
+  // Debug: speak on join so we can validate playback (green ring)
+  if (process.env.AUTO_SPEAK_ON_JOIN === '1') {
+    speak(state, 'Audio test. If you can hear this, TTS playback works.', 'system').catch((err) => {
+      console.error('AUTO_SPEAK_ON_JOIN failed', err);
+    });
+  }
+
   // Prime subscriptions for allowlisted users already in channel
   primeSubscriptions(state, voiceChannel).catch((err) => {
     console.error('primeSubscriptions error', err);
