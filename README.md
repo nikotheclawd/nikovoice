@@ -93,6 +93,18 @@ Add these **Bot Permissions** when inviting the bot:
 
 ## Local HTTP Endpoint
 
+The bot POSTs JSON to `OPENCLAW_ENDPOINT` (default `http://localhost:8000/respond`).
+
+### Quick bridge (placeholder)
+
+This repo includes a tiny local bridge server you can run immediately:
+
+```bash
+node bridge/server.js
+```
+
+Or install it as a systemd service (see `systemd/discord-voice-niko-bridge.service`).
+
 The bot POSTs JSON to `OPENCLAW_ENDPOINT`:
 
 ```json
