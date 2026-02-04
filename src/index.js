@@ -140,6 +140,19 @@ client.on('messageCreate', async (message) => {
     });
     await message.reply('Left the channel.');
   }
+
+  // Debug: force TTS playback to validate output path
+  if (content.startsWith('!say ')) {
+    const state = connections.get(message.guild.id);
+    if (!state) {
+      await message.reply('Not in voice.');
+      return;
+    }
+    const text = content.slice('!say '.length).trim().slice(0, 200);
+    if (!text) return;
+    await message.reply('ok');
+    await speak(state, text, message.author.id);
+  }
 });
 
 async function autoJoinVoiceChannel(channelId) {
