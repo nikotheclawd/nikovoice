@@ -1,0 +1,18 @@
+[Unit]
+Description=Discord Voice Bot (Niko)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/.openclaw/workspace/discord-voice-niko
+EnvironmentFile=/root/.openclaw/workspace/discord-voice-niko/.env
+ExecStart=/usr/bin/node /root/.openclaw/workspace/discord-voice-niko/src/index.js
+Restart=always
+RestartSec=5
+
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
