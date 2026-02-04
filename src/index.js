@@ -482,9 +482,19 @@ async function finalizeRecording(state, recording) {
     channelId: recording.channelId
   });
   const text = await transcribe(wavBuffer);
+  logEvent('stt_result', {
+    userId: recording.userId,
+    text: (text || '').slice(0, 300),
+    textLen: (text || '').length
+  });
   if (!text) return;
 
   const reply = await askOpenClaw(text, recording);
+  logEvent('agent_reply', {
+    userId: recording.userId,
+    reply: (reply || '').slice(0, 300),
+    replyLen: (reply || '').length
+  });
   if (!reply) return;
 
   await speak(state, reply, recording.userId);
