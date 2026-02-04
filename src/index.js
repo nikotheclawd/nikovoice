@@ -265,11 +265,11 @@ function startRecording(state, userId) {
     channelId: state.channelId
   });
 
+  // Keep a persistent subscription open so we don't depend on speaking events
+  // or timing (subscribe-before-speech). We'll segment utterances ourselves.
   const opusStream = receiver.subscribe(userId, {
     end: {
-      // Let discordjs/voice end the stream after silence.
-      behavior: EndBehaviorType.AfterSilence,
-      duration: SILENCE_MS
+      behavior: EndBehaviorType.Manual
     }
   });
 
@@ -283,8 +283,9 @@ function startRecording(state, userId) {
 
   const recording = {
     userId,
-    startedAt: Date.now(),
-    lastAudioAt: Date.now(),
+    startedAt: null,
+    lastAudioAt: 0,
+    active: false,
     chunks: [],
     bytes: 0,
     channelId: state.channelId,
@@ -294,12 +295,24 @@ function startRecording(state, userId) {
   state.recordings.set(userId, recording);
 
   pcmStream.on('data', (chunk) => {
+    const now = Date.now();
+    const energetic = hasVoiceEnergy(chunk, SILENCE_THRESHOLD);
+
+    if (!recording.active) {
+      if (!energetic) return;
+      // Start of an utterance
+      recording.active = true;
+      recording.startedAt = now;
+      recording.lastAudioAt = now;
+      recording.chunks = [];
+      recording.bytes = 0;
+      logEvent('utterance_start', { userId });
+    }
+
+    // While active, keep buffering
+    if (energetic) recording.lastAudioAt = now;
     recording.chunks.push(chunk);
     recording.bytes += chunk.length;
-
-    if (hasVoiceEnergy(chunk, SILENCE_THRESHOLD)) {
-      recording.lastAudioAt = Date.now();
-    }
 
     const durationMs = bytesToMs(recording.bytes);
     if (durationMs >= MAX_UTTERANCE_MS) {
@@ -307,7 +320,7 @@ function startRecording(state, userId) {
         userId: recording.userId,
         durationMs
       });
-      opusStream.destroy();
+      // We'll finalize via the timer.
     }
   });
 
@@ -355,39 +368,57 @@ function startRecording(state, userId) {
     }, 250);
   };
 
-  // Fallback silence detector (works even if EndBehavior doesn't emit reliably)
+  // Silence detector: segments utterances while keeping subscription open
   const interval = setInterval(() => {
+    if (!recording.active) return;
+
     const now = Date.now();
     const silenceFor = now - recording.lastAudioAt;
     const durationMs = bytesToMs(recording.bytes);
 
     if (durationMs >= MAX_UTTERANCE_MS) {
-      endAndFinalize('max_utterance');
+      // Finalize current utterance
+      logEvent('recording_end', { userId, durationMs, reason: 'max_utterance' });
+      finalizeRecording(state, recording).catch((err) => console.error('Finalize error', err));
+      // Reset for next utterance
+      recording.active = false;
+      recording.startedAt = null;
+      recording.lastAudioAt = 0;
+      recording.chunks = [];
+      recording.bytes = 0;
       return;
     }
 
     if (silenceFor >= SILENCE_MS && durationMs >= MIN_UTTERANCE_MS) {
-      endAndFinalize('silence_timer');
+      logEvent('recording_end', { userId, durationMs, reason: 'silence_timer' });
+      finalizeRecording(state, recording).catch((err) => console.error('Finalize error', err));
+      recording.active = false;
+      recording.startedAt = null;
+      recording.lastAudioAt = 0;
+      recording.chunks = [];
+      recording.bytes = 0;
       return;
     }
 
-    if (silenceFor >= SILENCE_MS * 6) {
-      // Give up if we never got enough audio.
-      cleanupRecording(state, userId);
-      try {
-        opusStream.destroy();
-      } catch {}
+    if (silenceFor >= SILENCE_MS * 10) {
+      // Reset stuck utterance
+      recording.active = false;
+      recording.startedAt = null;
+      recording.lastAudioAt = 0;
+      recording.chunks = [];
+      recording.bytes = 0;
     }
   }, 200);
 
   state.timers.set(userId, interval);
 
-  // When the Opus stream ends/closes, finalize.
-  opusStream.on('end', () => endAndFinalize('opus_end'));
-  opusStream.on('close', () => endAndFinalize('opus_close'));
+  opusStream.on('close', () => {
+    logEvent('opus_close', { userId });
+    cleanupRecording(state, userId);
+  });
   opusStream.on('error', (err) => {
     console.error('Opus stream error', err);
-    endAndFinalize('opus_error');
+    cleanupRecording(state, userId);
   });
 }
 
