@@ -594,11 +594,15 @@ async function speak(state, text, userId) {
     channelId: state.channelId
   });
 
+  logEvent('speak_begin', { userId: userId || 'unknown' });
+
   // Ensure voice connection is ready before attempting playback
   try {
     await entersState(state.connection, VoiceConnectionStatus.Ready, 10_000);
+    logEvent('voice_ready_ok', { userId: userId || 'unknown' });
   } catch (err) {
     console.error('Voice connection not ready for playback', err);
+    logEvent('voice_ready_fail', { userId: userId || 'unknown' });
     return;
   }
 
@@ -623,6 +627,7 @@ async function speak(state, text, userId) {
   const libDir = `${runtimeDir}/lib`;
 
   // 1) Generate WAV via sherpa-onnx binary (offline)
+  logEvent('sherpa_spawn', { userId: userId || 'unknown' });
   await new Promise((resolve, reject) => {
     const env = { ...process.env };
     env.LD_LIBRARY_PATH = env.LD_LIBRARY_PATH ? `${libDir}:${env.LD_LIBRARY_PATH}` : libDir;
@@ -646,9 +651,20 @@ async function speak(state, text, userId) {
       if (code === 0) return resolve();
       reject(new Error(`sherpa-onnx-offline-tts failed (code=${code}): ${stderr}`));
     });
-  }).catch((err) => {
-    console.error('Local TTS error', err);
-  });
+
+    // Hard timeout
+    setTimeout(() => {
+      try {
+        p.kill('SIGKILL');
+      } catch {}
+      reject(new Error('sherpa timeout'));
+    }, 15_000);
+  })
+    .then(() => logEvent('sherpa_ok', { userId: userId || 'unknown' }))
+    .catch((err) => {
+      console.error('Local TTS error', err);
+      logEvent('sherpa_fail', { userId: userId || 'unknown' });
+    });
 
   // 2) Transcode WAV -> raw PCM and play (discordjs/voice will opus-encode)
   const ffmpeg = spawn(
