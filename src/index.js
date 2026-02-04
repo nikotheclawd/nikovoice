@@ -81,6 +81,25 @@ client.on('voiceStateUpdate', (oldState, newState) => {
     old: s(oldState),
     now: s(newState)
   });
+
+  // Fallback: if Discord "speaking" events don't fire, start a receiver subscription
+  // when allowlisted users are present in our active voice channel.
+  try {
+    const guildId = newState.guild?.id;
+    if (!guildId) return;
+    const state = connections.get(guildId);
+    if (!state) return;
+
+    // Only care about allowlisted users.
+    if (!ALLOWLIST.has(newState.id)) return;
+
+    // If user is in our connected voice channel, ensure we have an active recording.
+    if (newState.channelId && newState.channelId === state.channelId) {
+      startRecording(state, newState.id);
+    }
+  } catch (err) {
+    console.error('voiceStateUpdate handler error', err);
+  }
 });
 
 client.on('messageCreate', async (message) => {
@@ -170,6 +189,11 @@ async function connectToChannel(voiceChannel, { manualLeave, autoJoin } = {}) {
     autoJoin: Boolean(autoJoin)
   });
 
+  // Prime subscriptions for allowlisted users already in channel
+  primeSubscriptions(state, voiceChannel).catch((err) => {
+    console.error('primeSubscriptions error', err);
+  });
+
   return state;
 }
 
@@ -217,94 +241,112 @@ async function attemptRejoin(state) {
   });
 }
 
-function setupReceiver(state, guildId, channelId) {
+async function primeSubscriptions(state, voiceChannel) {
+  try {
+    // voiceChannel.members is a Collection of members in the voice channel
+    for (const [memberId] of voiceChannel.members) {
+      if (!ALLOWLIST.has(memberId)) continue;
+      startRecording(state, memberId);
+    }
+  } catch (err) {
+    console.error('primeSubscriptions failed', err);
+  }
+}
+
+function startRecording(state, userId) {
+  if (!ALLOWLIST.has(userId)) return;
+  if (state.recordings.has(userId)) return;
+
   const receiver = state.connection.receiver;
 
-  receiver.speaking.on('start', (userId) => {
-    logEvent('speaking_start', {
-      userId,
-      guildId,
-      channelId
-    });
+  logEvent('recording_start', {
+    userId,
+    guildId: state.guildId,
+    channelId: state.channelId
+  });
 
-    if (!ALLOWLIST.has(userId)) {
-      logEvent('speaking_ignored_not_allowlisted', {
-        userId,
-        guildId,
-        channelId
+  const opusStream = receiver.subscribe(userId, {
+    end: {
+      // Let discordjs/voice end the stream after silence.
+      behavior: EndBehaviorType.AfterSilence,
+      duration: SILENCE_MS
+    }
+  });
+
+  const decoder = new prism.opus.Decoder({
+    rate: 48000,
+    channels: 2,
+    frameSize: 960
+  });
+
+  const pcmStream = opusStream.pipe(decoder);
+
+  const recording = {
+    userId,
+    startedAt: Date.now(),
+    lastAudioAt: Date.now(),
+    chunks: [],
+    bytes: 0,
+    channelId: state.channelId,
+    guildId: state.guildId
+  };
+
+  state.recordings.set(userId, recording);
+
+  pcmStream.on('data', (chunk) => {
+    recording.chunks.push(chunk);
+    recording.bytes += chunk.length;
+
+    if (hasVoiceEnergy(chunk, SILENCE_THRESHOLD)) {
+      recording.lastAudioAt = Date.now();
+    }
+
+    const durationMs = bytesToMs(recording.bytes);
+    if (durationMs >= MAX_UTTERANCE_MS) {
+      logEvent('utterance_too_long', {
+        userId: recording.userId,
+        durationMs
       });
+      opusStream.destroy();
+    }
+  });
+
+  pcmStream.on('error', (err) => {
+    console.error('PCM stream error', err);
+    cleanupRecording(state, userId);
+  });
+
+  // When the Opus stream ends (after silence), finalize.
+  opusStream.on('end', () => {
+    const durationMs = bytesToMs(recording.bytes);
+    logEvent('recording_end', { userId, durationMs });
+
+    if (durationMs < MIN_UTTERANCE_MS) {
+      cleanupRecording(state, userId);
       return;
     }
-    if (state.recordings.has(userId)) return;
 
-    const opusStream = receiver.subscribe(userId, {
-      end: {
-        behavior: EndBehaviorType.Manual
-      }
+    finalizeRecording(state, recording).catch((err) => {
+      console.error('Finalize error', err);
     });
 
-    const decoder = new prism.opus.Decoder({
-      rate: 48000,
-      channels: 2,
-      frameSize: 960
-    });
-
-    const pcmStream = opusStream.pipe(decoder);
-
-    const recording = {
-      userId,
-      startedAt: Date.now(),
-      lastAudioAt: Date.now(),
-      chunks: [],
-      bytes: 0,
-      channelId,
-      guildId
-    };
-
-    state.recordings.set(userId, recording);
-
-    pcmStream.on('data', (chunk) => {
-      recording.chunks.push(chunk);
-      recording.bytes += chunk.length;
-
-      if (hasVoiceEnergy(chunk, SILENCE_THRESHOLD)) {
-        recording.lastAudioAt = Date.now();
-      }
-    });
-
-    pcmStream.on('error', (err) => {
-      console.error('PCM stream error', err);
-      cleanupRecording(state, userId);
-    });
-
-    const interval = setInterval(() => {
-      const now = Date.now();
-      const silenceFor = now - recording.lastAudioAt;
-      const durationMs = bytesToMs(recording.bytes);
-
-      if (durationMs >= MAX_UTTERANCE_MS) {
-        logEvent('utterance_too_long', {
-          userId: recording.userId,
-          durationMs
-        });
-        cleanupRecording(state, userId);
-        return;
-      }
-
-      if (silenceFor >= SILENCE_MS && durationMs >= MIN_UTTERANCE_MS) {
-        finalizeRecording(state, recording).catch((err) => {
-          console.error('Finalize error', err);
-        });
-        cleanupRecording(state, userId);
-      }
-
-      if (silenceFor >= SILENCE_MS * 4) {
-        cleanupRecording(state, userId);
-      }
-    }, 200);
-
-    state.timers.set(userId, interval);
+    cleanupRecording(state, userId);
   });
+
+  // Keep the old speaking logs as diagnostics.
+  receiver.speaking.on('start', (speakingId) => {
+    if (speakingId !== userId) return;
+    logEvent('speaking_start', {
+      userId: speakingId,
+      guildId: state.guildId,
+      channelId: state.channelId
+    });
+  });
+}
+
+function setupReceiver(state, guildId, channelId) {
+  // Keep this function to preserve the callsite; all logic is in startRecording/primeSubscriptions.
+  logEvent('receiver_ready', { guildId, channelId });
 }
 
 async function finalizeRecording(state, recording) {
