@@ -87,17 +87,26 @@ client.on('voiceStateUpdate', (oldState, newState) => {
   // Fallback: if Discord "speaking" events don't fire, start a receiver subscription
   // when allowlisted users are present in our active voice channel.
   try {
-    const guildId = newState.guild?.id;
+    const guildId = newState.guild?.id || oldState.guild?.id;
     if (!guildId) return;
     const state = connections.get(guildId);
     if (!state) return;
 
     // Only care about allowlisted users.
-    if (!ALLOWLIST.has(newState.id)) return;
+    const isAllow = ALLOWLIST.has(newState.id) || ALLOWLIST.has(oldState.id);
+    if (!isAllow) return;
 
-    // If user is in our connected voice channel, ensure we have an active recording.
-    if (newState.channelId && newState.channelId === state.channelId) {
+    // Update standby mode when allowlisted presence changes
+    refreshStandby(state);
+
+    // If user joined our connected voice channel, ensure we have an active recording.
+    if (!state.standby && newState.channelId && newState.channelId === state.channelId) {
       startRecording(state, newState.id);
+    }
+
+    // If user left our connected voice channel, clean up any active recording.
+    if (oldState.channelId === state.channelId && newState.channelId !== state.channelId) {
+      cleanupRecording(state, oldState.id);
     }
   } catch (err) {
     console.error('voiceStateUpdate handler error', err);
@@ -200,7 +209,8 @@ async function connectToChannel(voiceChannel, { manualLeave, autoJoin } = {}) {
     guildId: voiceChannel.guild.id,
     channelId: voiceChannel.id,
     manualLeave: Boolean(manualLeave),
-    autoJoin: Boolean(autoJoin)
+    autoJoin: Boolean(autoJoin),
+    standby: false
   };
 
   connections.set(voiceChannel.guild.id, state);
@@ -225,6 +235,9 @@ async function connectToChannel(voiceChannel, { manualLeave, autoJoin } = {}) {
   primeSubscriptions(state, voiceChannel).catch((err) => {
     console.error('primeSubscriptions error', err);
   });
+
+  // Initialize standby based on current channel membership
+  refreshStandby(state);
 
   return state;
 }
@@ -280,11 +293,46 @@ async function attemptRejoin(state) {
   });
 }
 
+function refreshStandby(state) {
+  try {
+    const ch = client.channels.cache.get(state.channelId);
+    const allowCount =
+      ch && ch.isVoiceBased?.()
+        ? [...ch.members.values()].filter((m) => !m.user?.bot && ALLOWLIST.has(m.id)).length
+        : 0;
+
+    const shouldStandby = allowCount === 0;
+    if (shouldStandby === state.standby) return;
+
+    state.standby = shouldStandby;
+
+    if (state.standby) {
+      logEvent('standby_on', { guildId: state.guildId, channelId: state.channelId });
+      // Stop all active recordings to avoid STT usage while alone
+      for (const userId of [...state.recordings.keys()]) {
+        cleanupRecording(state, userId);
+      }
+    } else {
+      logEvent('standby_off', { guildId: state.guildId, channelId: state.channelId });
+      // Prime again for any allowlisted users currently present
+      if (ch?.isVoiceBased?.()) {
+        for (const [memberId] of ch.members) {
+          if (!ALLOWLIST.has(memberId)) continue;
+          startRecording(state, memberId);
+        }
+      }
+    }
+  } catch (err) {
+    console.error('refreshStandby error', err);
+  }
+}
+
 async function primeSubscriptions(state, voiceChannel) {
   try {
     // voiceChannel.members is a Collection of members in the voice channel
     for (const [memberId] of voiceChannel.members) {
       if (!ALLOWLIST.has(memberId)) continue;
+      if (state.standby) continue;
       startRecording(state, memberId);
     }
   } catch (err) {
@@ -294,6 +342,7 @@ async function primeSubscriptions(state, voiceChannel) {
 
 function startRecording(state, userId) {
   if (!ALLOWLIST.has(userId)) return;
+  if (state.standby) return;
   if (state.recordings.has(userId)) return;
 
   const receiver = state.connection.receiver;
@@ -330,6 +379,8 @@ function startRecording(state, userId) {
     // ring buffer before voice is detected, to avoid cutting the first syllable
     preRoll: [],
     preRollBytes: 0,
+    opusStream,
+    pcmStream,
     channelId: state.channelId,
     guildId: state.guildId
   };
@@ -531,6 +582,19 @@ function cleanupRecording(state, userId) {
   const interval = state.timers.get(userId);
   if (interval) clearInterval(interval);
   state.timers.delete(userId);
+
+  const rec = state.recordings.get(userId);
+  if (rec?.opusStream) {
+    try {
+      rec.opusStream.destroy();
+    } catch {}
+  }
+  if (rec?.pcmStream) {
+    try {
+      rec.pcmStream.destroy();
+    } catch {}
+  }
+
   state.recordings.delete(userId);
 }
 
