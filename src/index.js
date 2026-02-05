@@ -748,6 +748,11 @@ async function transcribe(wavBuffer) {
   // Force Italian to avoid random English garbage when audio is short/noisy
   form.append('language', 'it');
   form.append('temperature', '0');
+  form.append(
+    'prompt',
+    process.env.STT_PROMPT ||
+      "Trascrivi fedelmente in italiano. Se senti parole inglesi tecniche, mantienile. Non inventare parole."
+  );
 
   const res = await fetch(`${OPENAI_BASE_URL}/v1/audio/transcriptions`, {
     method: 'POST',

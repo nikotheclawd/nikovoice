@@ -7,6 +7,7 @@ app.use(express.json({ limit: '2mb' }));
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const OPENAI_BASE_URL = process.env.OPENAI_BASE_URL || 'https://api.openai.com';
 const CHAT_MODEL = process.env.CHAT_MODEL || 'gpt-4o-mini';
+const TIME_ZONE = process.env.TIME_ZONE || 'Europe/Rome';
 
 // Hard allowlist (defense-in-depth; bot already enforces)
 const ALLOWLIST = new Set(['323379312608673803', '381895367861600258']);
@@ -28,6 +29,20 @@ function pushMsg(thread, role, content) {
   if (thread.length > max) thread.splice(0, thread.length - max);
 }
 
+function nowParts() {
+  const now = new Date();
+  const hh = new Intl.DateTimeFormat('it-IT', { timeZone: TIME_ZONE, hour: '2-digit', hour12: false }).format(now);
+  const mm = new Intl.DateTimeFormat('it-IT', { timeZone: TIME_ZONE, minute: '2-digit' }).format(now);
+  const dd = new Intl.DateTimeFormat('it-IT', { timeZone: TIME_ZONE, day: '2-digit' }).format(now);
+  const mo = new Intl.DateTimeFormat('it-IT', { timeZone: TIME_ZONE, month: '2-digit' }).format(now);
+  const yy = new Intl.DateTimeFormat('it-IT', { timeZone: TIME_ZONE, year: 'numeric' }).format(now);
+  return { hh, mm, dd, mo, yy };
+}
+
+function isTimeQuestion(text) {
+  return /\b(che\s+ore\s+sono|che\s+ora\s+e\b|che\s+ora\s+è\b|che\s+ore\s+e\b|che\s+ore\s+è\b|mi\s+dici\s+l['’]ora|ora\?|orario)\b/i.test(text);
+}
+
 app.get('/health', (req, res) => {
   res.json({ ok: true });
 });
@@ -47,14 +62,22 @@ app.post('/respond', async (req, res) => {
       return res.status(500).json({ reply: 'Errore: OPENAI_API_KEY mancante sul bridge.' });
     }
 
+    // Cheap fast-path for time questions (no LLM, no tokens)
+    if (isTimeQuestion(cleaned)) {
+      const { hh, mm } = nowParts();
+      return res.json({ reply: `Sono le ${hh}:${mm}.` });
+    }
+
     const thread = getThread(userId);
 
+    const { hh, mm, dd, mo, yy } = nowParts();
     const system = {
       role: 'system',
       content:
-        "Sei NikoVoice, un assistente vocale in Discord. Rispondi SEMPRE in italiano, in modo naturale e conciso. " +
-        "Se non capisci bene l'audio o la frase è nonsense, chiedi di ripetere. " +
-        "Non leggere ad alta voce numeri lunghi o ID; se servono, riassumi."
+        "Sei NikoVoice, un assistente vocale in Discord. Rispondi SEMPRE e SOLO in italiano, in modo naturale e conciso. " +
+        "Se non capisci bene l'audio o la frase è nonsense, chiedi di ripetere e ripeti brevemente cosa hai capito. " +
+        "Non leggere ad alta voce numeri lunghi o ID; se servono, riassumi. " +
+        `Ora corrente (timezone ${TIME_ZONE}): ${hh}:${mm} del ${dd}/${mo}/${yy}.`
     };
 
     pushMsg(thread, 'user', cleaned);
