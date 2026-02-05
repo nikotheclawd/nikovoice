@@ -28,6 +28,13 @@ const SILENCE_MS = Number(process.env.SILENCE_MS || 800);
 const MIN_UTTERANCE_MS = Number(process.env.MIN_UTTERANCE_MS || 600);
 const SILENCE_THRESHOLD = Number(process.env.SILENCE_THRESHOLD || 0.01); // RMS threshold 0-1
 const PRE_ROLL_MS = Number(process.env.PRE_ROLL_MS || 300);
+
+// Turn-taking: allow user to interrupt bot speech (barge-in)
+const BARGE_IN_ENABLED = process.env.BARGE_IN !== '0';
+const BARGE_IN_THRESHOLD = Number(process.env.BARGE_IN_THRESHOLD || 0.02);
+
+// STT optimization: send 16kHz mono wav to STT
+const STT_SAMPLE_RATE = Number(process.env.STT_SAMPLE_RATE || 16000);
 const MAX_UTTERANCE_MS = Number(process.env.MAX_UTTERANCE_MS || 15000);
 const RATE_LIMIT_WINDOW_MS = Number(process.env.RATE_LIMIT_WINDOW_MS || 60000);
 const RATE_LIMIT_STT_MAX = Number(process.env.RATE_LIMIT_STT_MAX || 10);
@@ -379,6 +386,9 @@ function startRecording(state, userId) {
     // ring buffer before voice is detected, to avoid cutting the first syllable
     preRoll: [],
     preRollBytes: 0,
+    // barge-in detector
+    bargeHits: 0,
+    bargeLastAt: 0,
     opusStream,
     pcmStream,
     channelId: state.channelId,
@@ -388,18 +398,37 @@ function startRecording(state, userId) {
   state.recordings.set(userId, recording);
 
   pcmStream.on('data', (chunk) => {
-    // Avoid feedback/echo: ignore incoming audio while we're speaking
+    const now = Date.now();
+    const rms = computeRms(chunk);
+    const energetic = rms >= SILENCE_THRESHOLD;
+
+    // While bot is speaking, ignore audio to avoid noise, BUT allow barge-in.
     if (
       state.player.state.status === AudioPlayerStatus.Playing ||
       state.player.state.status === AudioPlayerStatus.Buffering
     ) {
-      recording.preRoll = [];
-      recording.preRollBytes = 0;
-      return;
-    }
+      if (BARGE_IN_ENABLED && rms >= BARGE_IN_THRESHOLD) {
+        // require a couple of consecutive hits to avoid false positives
+        if (now - (recording.bargeLastAt || 0) < 250) recording.bargeHits += 1;
+        else recording.bargeHits = 1;
+        recording.bargeLastAt = now;
 
-    const now = Date.now();
-    const energetic = hasVoiceEnergy(chunk, SILENCE_THRESHOLD);
+        if (recording.bargeHits >= 2) {
+          recording.bargeHits = 0;
+          logEvent('barge_in', { userId, rms });
+          try {
+            state.player.stop(true);
+          } catch {}
+          // continue processing this chunk as potential speech start
+        } else {
+          return;
+        }
+      } else {
+        recording.preRoll = [];
+        recording.preRollBytes = 0;
+        return;
+      }
+    }
 
     // Maintain a short pre-roll buffer while not active
     if (!recording.active) {
@@ -552,12 +581,14 @@ async function finalizeRecording(state, recording) {
   }
 
   const pcmBuffer = Buffer.concat(recording.chunks);
-  const wavBuffer = await pcmToWav(pcmBuffer, 48000, 2);
+  const wavBuffer = await pcmToWavForStt(pcmBuffer, 48000, 2);
 
   logEvent('stt_request', {
     userId: recording.userId,
     guildId: recording.guildId,
-    channelId: recording.channelId
+    channelId: recording.channelId,
+    wavBytes: wavBuffer.length,
+    sttRate: STT_SAMPLE_RATE
   });
   const text = await transcribe(wavBuffer);
   logEvent('stt_result', {
@@ -603,7 +634,7 @@ function bytesToMs(bytes) {
   return Math.round((bytes / bytesPerSecond) * 1000);
 }
 
-function hasVoiceEnergy(chunk, threshold) {
+function computeRms(chunk) {
   let sum = 0;
   const samples = chunk.length / 2;
   for (let i = 0; i < chunk.length; i += 2) {
@@ -611,8 +642,11 @@ function hasVoiceEnergy(chunk, threshold) {
     const sample = int16 / 32768;
     sum += sample * sample;
   }
-  const rms = Math.sqrt(sum / samples);
-  return rms >= threshold;
+  return Math.sqrt(sum / samples);
+}
+
+function hasVoiceEnergy(chunk, threshold) {
+  return computeRms(chunk) >= threshold;
 }
 
 async function pcmToWav(pcmBuffer, sampleRate, channels) {
@@ -637,6 +671,66 @@ async function pcmToWav(pcmBuffer, sampleRate, channels) {
     channelData
   });
   return Buffer.from(wav);
+}
+
+async function pcmToWavForStt(pcmBuffer, sampleRate, channels) {
+  // Use ffmpeg to resample to 16kHz mono WAV to reduce latency and improve STT stability.
+  // Fallback to JS wav encoder if ffmpeg fails.
+  try {
+    const { spawn } = await import('node:child_process');
+
+    const out = await new Promise((resolve, reject) => {
+      const ff = spawn(
+        'ffmpeg',
+        [
+          '-hide_banner',
+          '-loglevel',
+          'error',
+          '-f',
+          's16le',
+          '-ar',
+          String(sampleRate),
+          '-ac',
+          String(channels),
+          '-i',
+          'pipe:0',
+          '-ac',
+          '1',
+          '-ar',
+          String(STT_SAMPLE_RATE),
+          '-c:a',
+          'pcm_s16le',
+          '-f',
+          'wav',
+          'pipe:1'
+        ],
+        { stdio: ['pipe', 'pipe', 'pipe'] }
+      );
+
+      const chunks = [];
+      let size = 0;
+      let stderr = '';
+
+      ff.stdout.on('data', (d) => {
+        chunks.push(d);
+        size += d.length;
+      });
+      ff.stderr.on('data', (d) => (stderr += d.toString()));
+
+      ff.on('error', reject);
+      ff.on('exit', (code) => {
+        if (code === 0) return resolve(Buffer.concat(chunks, size));
+        reject(new Error(`ffmpeg stt resample failed (code=${code}): ${stderr}`));
+      });
+
+      ff.stdin.end(pcmBuffer);
+    });
+
+    return out;
+  } catch (err) {
+    console.error('pcmToWavForStt fallback to JS encoder', err);
+    return pcmToWav(pcmBuffer, sampleRate, channels);
+  }
 }
 
 async function transcribe(wavBuffer) {
