@@ -614,7 +614,7 @@ async function finalizeRecording(state, recording) {
   });
   if (!reply) return;
 
-  await speak(state, reply, recording.userId);
+  await speak(state, cleanForSpeech(reply), recording.userId);
 }
 
 function cleanupRecording(state, userId) {
@@ -1023,6 +1023,21 @@ function isRateLimited(userId, kind) {
 
   rateLimits.set(userId, entry);
   return false;
+}
+
+function cleanForSpeech(text) {
+  // Remove common markdown that sounds awful in TTS
+  return String(text || '')
+    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/`([^`]+)`/g, '$1')
+    .replace(/\*\*([^*]+)\*\*/g, '$1')
+    .replace(/\*([^*]+)\*/g, '$1')
+    .replace(/_([^_]+)_/g, '$1')
+    .replace(/\[(.*?)\]\((.*?)\)/g, '$1')
+    .replace(/<([^>]+)>/g, '$1')
+    .replace(/#+\s*/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
 function logEvent(event, data) {
