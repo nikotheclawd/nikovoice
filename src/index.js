@@ -217,7 +217,8 @@ async function connectToChannel(voiceChannel, { manualLeave, autoJoin } = {}) {
     channelId: voiceChannel.id,
     manualLeave: Boolean(manualLeave),
     autoJoin: Boolean(autoJoin),
-    standby: false
+    standby: false,
+    currentPlayback: null
   };
 
   connections.set(voiceChannel.guild.id, state);
@@ -419,6 +420,13 @@ function startRecording(state, userId) {
           try {
             state.player.stop(true);
           } catch {}
+          // Kill current transcoder if any to avoid EPIPE / dangling processes
+          if (state.currentPlayback) {
+            try {
+              state.currentPlayback.kill('SIGKILL');
+            } catch {}
+            state.currentPlayback = null;
+          }
           // continue processing this chunk as potential speech start
         } else {
           return;
@@ -847,9 +855,22 @@ async function speak(state, text, userId) {
       { stdio: ['pipe', 'pipe', 'pipe'] }
     );
 
+    // Track active transcoder so barge-in can kill it safely
+    state.currentPlayback = ffmpeg;
+
     let ffErr = '';
     ffmpeg.stderr.on('data', (d) => (ffErr += d.toString()));
+    ffmpeg.stdin.on('error', (err) => {
+      // Expected when we barge-in and kill ffmpeg mid-write
+      if (err?.code === 'EPIPE') return;
+      console.error('ffmpeg stdin error', err);
+    });
+    ffmpeg.stdout.on('error', (err) => {
+      console.error('ffmpeg stdout error', err);
+    });
+
     ffmpeg.on('exit', (code) => {
+      if (state.currentPlayback === ffmpeg) state.currentPlayback = null;
       if (code && code !== 0) {
         console.error('ffmpeg failed', code, ffErr);
       } else {
@@ -932,9 +953,15 @@ async function speak(state, text, userId) {
     { stdio: ['ignore', 'pipe', 'pipe'] }
   );
 
+  state.currentPlayback = ffmpeg;
+
   let ffErr = '';
   ffmpeg.stderr.on('data', (d) => (ffErr += d.toString()));
+  ffmpeg.stdout.on('error', (err) => {
+    console.error('ffmpeg stdout error', err);
+  });
   ffmpeg.on('exit', (code) => {
+    if (state.currentPlayback === ffmpeg) state.currentPlayback = null;
     if (code && code !== 0) {
       console.error('ffmpeg failed', code, ffErr);
     } else {
